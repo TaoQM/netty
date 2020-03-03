@@ -24,7 +24,15 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.resolver.HostsFileEntriesResolver;
 import io.netty.resolver.ResolvedAddressTypes;
 import io.netty.util.concurrent.Future;
+import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.security.AccessController;
+import java.security.PrivilegedAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -37,6 +45,9 @@ import static io.netty.util.internal.ObjectUtil.intValue;
  * A {@link DnsNameResolver} builder.
  */
 public final class DnsNameResolverBuilder {
+    private static final InternalLogger LOGGER = InternalLoggerFactory.getInstance(DnsNameResolverBuilder.class);
+    private static final Constructor<? extends DnsServerAddressStreamProvider> STREAM_PROVIDER_CONSTRUCTOR;
+
     private EventLoop eventLoop;
     private ChannelFactory<? extends DatagramChannel> channelFactory;
     private ChannelFactory<? extends SocketChannel> socketChannelFactory;
@@ -55,12 +66,67 @@ public final class DnsNameResolverBuilder {
     private int maxPayloadSize = 4096;
     private boolean optResourceEnabled = true;
     private HostsFileEntriesResolver hostsFileEntriesResolver = HostsFileEntriesResolver.DEFAULT;
-    private DnsServerAddressStreamProvider dnsServerAddressStreamProvider = platformDefault();
+    private DnsServerAddressStreamProvider dnsServerAddressStreamProvider = defaultStreamProvider();
     private DnsQueryLifecycleObserverFactory dnsQueryLifecycleObserverFactory =
             NoopDnsQueryLifecycleObserverFactory.INSTANCE;
     private String[] searchDomains;
     private int ndots = -1;
     private boolean decodeIdn = true;
+
+    static {
+        Constructor<? extends DnsServerAddressStreamProvider> constructor = null;
+        if (PlatformDependent.isOsx()) {
+            try {
+                // As MacOSDnsServerAddressStreamProvider is contained in another jar which depends on this jar
+                // we use reflection to use it if its on the classpath.
+                Object maybeProvider = AccessController.doPrivileged(new PrivilegedAction<Object>() {
+                    @Override
+                    public Object run() {
+                        try {
+                            return Class.forName(
+                                    "io.netty.resolver.dns.macos.MacOSDnsServerAddressStreamProvider",
+                                    false,
+                                    PlatformDependent.getSystemClassLoader());
+                        } catch (Throwable cause) {
+                            return cause;
+                        }
+                    }
+                });
+                if (maybeProvider instanceof Class) {
+                    @SuppressWarnings("unchecked")
+                    Class<? extends DnsServerAddressStreamProvider> providerClass =
+                            (Class<? extends DnsServerAddressStreamProvider>) maybeProvider;
+                    Method method = providerClass.getMethod("isAvailable");
+                    if (Boolean.TRUE.equals(method.invoke(null))) {
+                        constructor = providerClass.getConstructor();
+                        constructor.newInstance();
+                    }
+                } else if (!(maybeProvider instanceof ClassNotFoundException)) {
+                    throw (Throwable) maybeProvider;
+                }
+            } catch (Throwable cause) {
+                LOGGER.debug(
+                        "Unable to use MacOSDnsServerAddressStreamProvider, fallback to system defaults", cause);
+                constructor = null;
+            }
+        }
+        STREAM_PROVIDER_CONSTRUCTOR = constructor;
+    }
+
+    private static DnsServerAddressStreamProvider defaultStreamProvider() {
+        if (STREAM_PROVIDER_CONSTRUCTOR != null) {
+            try {
+                return STREAM_PROVIDER_CONSTRUCTOR.newInstance();
+            } catch (IllegalAccessException e) {
+                // ignore
+            } catch (InstantiationException e) {
+                // ignore
+            } catch (InvocationTargetException e) {
+                // ignore
+            }
+        }
+        return platformDefault();
+    }
 
     /**
      * Creates a new builder.
